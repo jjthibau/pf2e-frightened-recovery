@@ -1,0 +1,3 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {recoveryValue,recoveryFloor,DREAD} from '../scripts/rules.js';
+test('Recovery never raises frightened when a floor exceeds the current value',()=>{assert.equal(recoveryValue(1,2),1);assert.equal(recoveryValue(3,1),2);assert.equal(recoveryValue(1),0);assert.equal(recoveryValue(3,0,true),3);});
+test('Failed Dread saves combine floors; greater prevents any decrease',()=>{assert.equal(recoveryFloor(0,4,[{...DREAD.lesserDread,outcome:'failure'},{...DREAD.moderateDread,outcome:'failure'}]),2);assert.equal(recoveryFloor(0,4,[{...DREAD.greaterDread,outcome:'failure'}]),4);assert.equal(recoveryFloor(1,4,[{...DREAD.greaterDread,outcome:'success'}]),1);});

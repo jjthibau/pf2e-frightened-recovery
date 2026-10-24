@@ -1,0 +1,1 @@
+{"name":"pf2e-frightened-recovery","version":"0.1.0","private":true,"type":"module","scripts":{"test":"node --test tests/rules.test.mjs && node --check scripts/main.js && npm run build && npm run check:release","build":"python tools/build_release.py","check:release":"python tools/check_release.py","test:native":"node tests/run-native.mjs"}}

@@ -1,0 +1,4 @@
+.frightened-recovery p { margin: 0.35em 0; }
+.frightened-recovery button { width: 100%; }
+.frightened-gm-controls { display: flex; gap: 4px; margin-top: 5px; }
+.frightened-gm-controls button { font-size: var(--font-size-12); }
