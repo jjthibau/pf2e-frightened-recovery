@@ -38,17 +38,49 @@ function restrictions(token){
  }
  return {floor,hold:!!override.hold,reasons,sources};
 }
+function frightenedSources(actor){
+ return actor.itemTypes.condition.filter(item=>item.slug==='frightened').map(item=>({
+  id:item.id,value:item._source.system.value.value,locked:Boolean(item.isLocked),
+ }));
+}
+function recoveryPlan(request){
+ const floor=recoveryFloor(request.floor,request.value,request.sources);
+ return request.conditions.map(source=>({...source,next:recoveryValue(source.value,floor,request.hold)}));
+}
+function matchesSources(actor,request,plan){
+ const current=new Map(frightenedSources(actor).map(source=>[source.id,source]));
+ const expected=request.allConditions??request.conditions;
+ if(current.size>expected.length)return false;
+ const nextValues=new Map(plan.map(source=>[source.id,source.next]));
+ for(const source of expected){
+  const actual=current.get(source.id),next=nextValues.get(source.id);
+  if(actual?(actual.locked!==Boolean(source.locked)||actual.value!==source.value&&actual.value!==next):next!==0)return false;
+  current.delete(source.id);
+ }
+ return current.size===0;
+}
 async function finish(message,request){
  const token=await fromUuid(request.targetUUID),actor=token?.actor;
- const conditions=request.conditions.map(c=>actor?.items.get(c.id));
- // Do not overwrite a new fear application or a manual edit while a save was pending.
- if(!actor||conditions.some((c,i)=>!c||c._source.system.value.value!==request.conditions[i].value)){
+ const plan=request.plan??[];
+ // A plan persisted before mutation can recognize previously completed writes.
+ // Before a plan exists, any changed source requires GM review.
+ if(!actor||request.actorUUID&&actor.uuid!==request.actorUUID||!matchesSources(actor,request,plan)){
   request.status='changed';request.note='Frightened changed while recovery was pending; resolve this turn manually.';
  }else{
   const floor=recoveryFloor(request.floor,request.value,request.sources);
-  for(let i=0;i<conditions.length;i++){
-   const condition=conditions[i],value=request.conditions[i].value,next=recoveryValue(value,floor,request.hold);
-   if(next!==value)await game.pf2e.ConditionManager.updateConditionValue(condition.id,actor,next);
+  if(message&&!request.plan){
+   request.plan=recoveryPlan(request);
+   await message.setFlag(ID,'recovery',request);
+  }
+  for(const source of request.plan??recoveryPlan(request)){
+   const condition=actor.items.get(source.id);
+   if(condition?._source.system.value.value===source.value&&source.next!==source.value){
+    await game.pf2e.ConditionManager.updateConditionValue(source.id,actor,source.next);
+    const updated=actor.items.get(source.id);
+    if(source.next===0?updated:updated?._source.system.value.value!==source.next){
+     throw Error('The frightened recovery write was not confirmed.');
+    }
+   }
   }
   request.status='resolved';request.result=recoveryValue(request.value,floor,request.hold);
   request.note=request.result===request.value?'Recovery held: '+([...request.reasons,...request.sources.filter(s=>s.outcome==='failure'||s.outcome==='criticalFailure').map(()=> 'Dread rune')].join(', ')||'minimum frightened'):`Frightened ${request.value} → ${request.result}`;
@@ -61,26 +93,70 @@ function content(r){
  const note=r.status==='pending'?'Resolve the Dread rune save before frightened decreases.':r.status==='changed'?'GM: resolve this recovery manually.':'Recovery resolved.';
  return `<section class="frightened-recovery"><strong>Frightened Recovery</strong><p>${note}</p>${r.sources.map((s,i)=>`<div>${s.outcome?'Will save resolved.':`<button type="button" data-frightened-save="${i}">Roll Will Save${dcVisible?' (DC '+s.dc+')':''}</button>`}${s.uncertain&&!s.outcome?'<p>GM: confirm the creature can see the rune wearer, or ignore this rune.</p>':''}</div>`).join('')}</section>`;
 }
-export async function endTurn(combatant,encounter){
+async function applyTurn(combatant,encounter,round){
  if(!gm()||!game.settings.get(ID,'enabled')||!encounter.started||game.modules.get('xdy-pf2e-workbench')?.active)return;
  const candidate=canvas.scene?.tokens.get(combatant.tokenId);
  const token=combatant.token??(!combatant.sceneId&&candidate?.actorId===combatant.actorId?candidate:null),actor=token?.actor;
  if(!actor||actor.isDead||!canvas.ready||token.scene!==canvas.scene)return;
- const round=combatant.flags.pf2e.roundOfLastTurnEnd??encounter.round;
  if(combatant.getFlag(ID,'lastRound')===round)return;
- const all=actor.itemTypes.condition.filter(c=>c.slug==='frightened');
- const value=Math.max(0,...all.map(c=>c._source.system.value.value??0));if(!value)return;
- const prior=game.messages.get(actor.getFlag(ID,'pending'));if(flag(prior)?.status==='pending')return;
+ const turnKey=`${encounter.id}:${combatant.id}:${round}`;
+ const saved=combatant.getFlag(ID,'recoveryWork');
+ const prior=game.messages.get(actor.getFlag(ID,'pending'));
+ let r=saved?.turnKey===turnKey?foundry.utils.deepClone(saved):null;
+ if(!r){
+  if(saved&&saved.round!==combatant.getFlag(ID,'lastRound')){
+   await applyTurn(combatant,encounter,saved.round);
+   if(combatant.getFlag(ID,'lastRound')===round)return;
+  }
+  if(flag(prior)?.status==='pending')return;
+  const allConditions=frightenedSources(actor);
+  const value=Math.max(0,...allConditions.map(source=>source.value??0));
+  const conditions=allConditions.filter(source=>!source.locked);
+  if(!value||!conditions.length)return;
+  const limits=restrictions(token),locked=Math.max(0,...allConditions.filter(source=>source.locked).map(source=>source.value??0));
+  if(locked){limits.floor=Math.max(limits.floor,locked);limits.reasons.push('parent-granted frightened minimum');}
+  r={status:'pending',targetUUID:token.uuid,actorUUID:actor.uuid,turnKey,round,conditions,allConditions,value,...limits};
+  if(r.hold||!r.sources.length)r.plan=recoveryPlan(r);
+  await combatant.setFlag(ID,'recoveryWork',r);
+  if(combatant.getFlag(ID,'recoveryWork')?.turnKey!==turnKey)throw Error('The frightened recovery plan was not saved.');
+ }
+ if(r.plan){
+  await finish(null,r);
+  if(r.status==='changed'||r.hold||r.floor)ui.notifications.info(r.note);
+ }else{
+  const existing=game.messages.contents.find(message=>flag(message)?.turnKey===turnKey);
+  const message=existing??await ChatMessage.create({speaker:ChatMessage.getSpeaker({actor,token}),content:content(r),whisper:r.sources.some(s=>s.uncertain)?game.users.filter(u=>u.isGM).map(u=>u.id):[],flags:{[ID]:{recovery:r}}});
+  if(!message)throw Error('Frightened recovery card was not created.');
+  if(flag(message)?.status==='pending'&&prior?.id!==message.id)await actor.setFlag(ID,'pending',message.id);
+ }
  await combatant.setFlag(ID,'lastRound',round);
- // Locked grants are controlled by their parent effect. Reduce free-standing sources without deleting the grant.
- const conditions=all.filter(c=>!c.isLocked).map(c=>({id:c.id,value:c._source.system.value.value}));
- if(!conditions.length)return;
- const limits=restrictions(token),locked=Math.max(0,...all.filter(c=>c.isLocked).map(c=>c._source.system.value.value??0));
- if(locked){limits.floor=Math.max(limits.floor,locked);limits.reasons.push('parent-granted frightened minimum');}
- const r={status:'pending',targetUUID:token.uuid,conditions,value,...limits};
- if(r.hold||!r.sources.length){await finish(null,r);if(r.hold||r.floor)ui.notifications.info(r.note);return;}
- const message=await ChatMessage.create({speaker:ChatMessage.getSpeaker({actor,token}),content:content(r),whisper:r.sources.some(s=>s.uncertain)?game.users.filter(u=>u.isGM).map(u=>u.id):[],flags:{[ID]:{recovery:r}}});
- await actor.setFlag(ID,'pending',message.id);
+}
+const turnsInProgress=new Map();
+export async function endTurn(combatant,encounter,round=combatant.flags.pf2e.roundOfLastTurnEnd??encounter.round){
+ const key=`${encounter.id}:${combatant.id}`;
+ if(turnsInProgress.has(key))return turnsInProgress.get(key);
+ const work=Promise.resolve().then(async()=>{
+  try{await applyTurn(combatant,encounter,round);}
+  catch{await applyTurn(combatant,encounter,round);}
+ });
+ turnsInProgress.set(key,work);
+ try{await work;}finally{turnsInProgress.delete(key);}
+}
+async function recoverInterrupted(){
+ if(!gm()||!game.settings.get(ID,'enabled')||game.modules.get('xdy-pf2e-workbench')?.active||!canvas.ready)return;
+ for(const encounter of game.combats){
+  if(!encounter.started)continue;
+  for(const combatant of encounter.combatants){
+   const work=combatant.getFlag(ID,'recoveryWork');
+   if(work&&work.round!==combatant.getFlag(ID,'lastRound'))await endTurn(combatant,encounter,work.round);
+  }
+ }
+ for(const token of canvas.scene.tokens){
+  const actor=token.actor,card=game.messages.get(actor?.getFlag(ID,'pending')),request=flag(card);
+  if(request?.targetUUID===token.uuid&&request.status==='pending'&&request.sources.every(source=>source.outcome)){
+   await finish(card,foundry.utils.deepClone(request));
+  }
+ }
 }
 export async function rollSave(message,index,event){
  const r=flag(message),token=r&&await fromUuid(r.targetUUID),actor=token?.actor,key=message.id+':'+index;
@@ -96,7 +172,8 @@ async function result(message){
  if(!gm()||!game.settings.get(ID,'enabled'))return;const c=message.flags.pf2e?.context;
  if(c?.type!=='saving-throw'||!outcomes.has(c.outcome))return;
  const tag=c.options?.find(s=>s.startsWith('frightened-recovery:'));if(!tag)return;
- const[,id,idx]=tag.split(':'),card=game.messages.get(id),r=flag(card),index=Number(idx),s=r?.sources[index];
+ const[,id,idx]=tag.split(':'),card=game.messages.get(id),index=Number(idx);
+ const saved=flag(card),r=saved&&foundry.utils.deepClone(saved),s=r?.sources[index];
  if(r?.status!=='pending'||!s||s.outcome||c.dc?.value!==s.dc)return;
  const token=await fromUuid(r.targetUUID);
  if(message.token?.uuid!==r.targetUUID||!token?.actor?.testUserPermission(message.author,'OWNER'))return;
@@ -111,6 +188,8 @@ async function configure(actor){
 Hooks.once('init',()=>game.settings.register(ID,'enabled',{name:'Automatic frightened recovery',hint:'Reduce frightened at the end of turns, respecting supported exceptions. Automatically pauses if PF2e Workbench is active to avoid double recovery.',scope:'world',config:true,type:Boolean,default:true}));
 Hooks.on('pf2e.endTurn',(c,e)=>{if(gm())void enqueue(()=>endTurn(c,e));});
 Hooks.on('createChatMessage',m=>{if(gm())void enqueue(()=>result(m));});
+Hooks.on('canvasReady',()=>{if(gm())void enqueue(recoverInterrupted);});
+Hooks.on('updateUser',(_user,changes)=>{if(gm()&&('active' in changes))void enqueue(recoverInterrupted);});
 Hooks.on('getActorSheetHeaderButtons',(sheet,buttons)=>{if(game.user.isGM)buttons.unshift({label:'Frightened',class:'frightened-recovery-config',icon:'fa-solid fa-ghost',onclick:()=>configure(sheet.actor)});});
 Hooks.on('renderChatMessageHTML',(message,html)=>{
  const r=flag(message);if(!r)return;

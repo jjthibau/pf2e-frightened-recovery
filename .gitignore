@@ -32,3 +32,4 @@
 !/tests/
 /tests/*
 !/tests/rules.test.mjs
+!/tests/retry.test.mjs
